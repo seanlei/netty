@@ -188,6 +188,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
     // Store as object as AlgorithmConstraints only exists since java 7.
     private Object algorithmConstraints;
     private List<String> sniHostNames;
+    private Collection<SNIMatcher> matchers;
 
     // SSL Engine status variables
     private boolean isInboundDone;
@@ -1554,6 +1555,8 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                     Java8SslParametersUtils.setUseCipherSuitesOrder(
                             sslParameters, (SSL.getOptions(ssl) & SSL.SSL_OP_CIPHER_SERVER_PREFERENCE) != 0);
                 }
+
+                sslParameters.setSNIMatchers(matchers);
             }
         }
         return sslParameters;
@@ -1568,11 +1571,6 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
             }
 
             if (version >= 8) {
-                Collection<SNIMatcher> matchers = sslParameters.getSNIMatchers();
-                if (matchers != null && !matchers.isEmpty()) {
-                    throw new IllegalArgumentException("SNIMatchers are not supported.");
-                }
-
                 if (!isDestroyed()) {
                     if (clientMode) {
                         final List<String> sniHostNames = Java8SslParametersUtils.getSniHostNames(sslParameters);
@@ -1587,6 +1585,7 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
                         SSL.clearOptions(ssl, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
                     }
                 }
+                matchers = sslParameters.getSNIMatchers();
             }
 
             final String endPointIdentificationAlgorithm = sslParameters.getEndpointIdentificationAlgorithm();
