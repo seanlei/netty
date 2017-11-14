@@ -16,16 +16,20 @@
 
 package io.netty.handler.ssl;
 
+import static io.netty.util.internal.ObjectUtil.checkNotNull;
+
+import io.netty.util.internal.UnstableApi;
+
+import java.security.Provider;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.TrustManagerFactory;
+
 import java.io.File;
 import java.io.InputStream;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
-import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLEngine;
-import javax.net.ssl.SSLException;
-import javax.net.ssl.TrustManagerFactory;
-
-import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 /**
  * Builder for configuring a new SslContext for creation.
@@ -126,6 +130,7 @@ public final class SslContextBuilder {
 
     private final boolean forServer;
     private SslProvider provider;
+    private Provider sslContextProvider;
     private X509Certificate[] trustCertCollection;
     private TrustManagerFactory trustManagerFactory;
     private X509Certificate[] keyCertChain;
@@ -140,6 +145,7 @@ public final class SslContextBuilder {
     private ClientAuth clientAuth = ClientAuth.NONE;
     private String[] protocols;
     private boolean startTls;
+    private boolean enableOcsp;
 
     private SslContextBuilder(boolean forServer) {
         this.forServer = forServer;
@@ -150,6 +156,15 @@ public final class SslContextBuilder {
      */
     public SslContextBuilder sslProvider(SslProvider provider) {
         this.provider = provider;
+        return this;
+    }
+
+    /**
+     * The SSLContext {@link Provider} to use. {@code null} uses the default one. This is only
+     * used with {@link SslProvider#JDK}.
+     */
+    public SslContextBuilder sslContextProvider(Provider sslContextProvider) {
+        this.sslContextProvider = sslContextProvider;
         return this;
     }
 
@@ -405,19 +420,32 @@ public final class SslContextBuilder {
     }
 
     /**
+     * Enables OCSP stapling. Please note that not all {@link SslProvider} implementations support OCSP
+     * stapling and an exception will be thrown upon {@link #build()}.
+     *
+     * @see OpenSsl#isOcspSupported()
+     */
+    @UnstableApi
+    public SslContextBuilder enableOcsp(boolean enableOcsp) {
+        this.enableOcsp = enableOcsp;
+        return this;
+    }
+
+    /**
      * Create new {@code SslContext} instance with configured settings.
      * <p>If {@link #sslProvider(SslProvider)} is set to {@link SslProvider#OPENSSL_REFCNT} then the caller is
      * responsible for releasing this object, or else native memory may leak.
      */
     public SslContext build() throws SSLException {
         if (forServer) {
-            return SslContext.newServerContextInternal(provider, trustCertCollection,
+            return SslContext.newServerContextInternal(provider, sslContextProvider, trustCertCollection,
                 trustManagerFactory, keyCertChain, key, keyPassword, keyManagerFactory,
-                ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, clientAuth, protocols, startTls);
+                ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, clientAuth, protocols, startTls,
+                enableOcsp);
         } else {
-            return SslContext.newClientContextInternal(provider, trustCertCollection,
+            return SslContext.newClientContextInternal(provider, sslContextProvider, trustCertCollection,
                 trustManagerFactory, keyCertChain, key, keyPassword, keyManagerFactory,
-                ciphers, cipherFilter, apn, protocols, sessionCacheSize, sessionTimeout);
+                ciphers, cipherFilter, apn, protocols, sessionCacheSize, sessionTimeout, enableOcsp);
         }
     }
 }

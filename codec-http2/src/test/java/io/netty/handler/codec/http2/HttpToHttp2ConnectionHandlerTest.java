@@ -61,7 +61,6 @@ import static io.netty.handler.codec.http.HttpMethod.POST;
 import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 import static io.netty.handler.codec.http2.Http2TestUtil.of;
 import static io.netty.util.CharsetUtil.UTF_8;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -105,24 +104,24 @@ public class HttpToHttp2ConnectionHandlerTest {
     @After
     public void teardown() throws Exception {
         if (clientChannel != null) {
-            clientChannel.close().sync();
+            clientChannel.close().syncUninterruptibly();
             clientChannel = null;
         }
         if (serverChannel != null) {
-            serverChannel.close().sync();
+            serverChannel.close().syncUninterruptibly();
             serverChannel = null;
         }
         final Channel serverConnectedChannel = this.serverConnectedChannel;
         if (serverConnectedChannel != null) {
-            serverConnectedChannel.close().sync();
+            serverConnectedChannel.close().syncUninterruptibly();
             this.serverConnectedChannel = null;
         }
-        Future<?> serverGroup = sb.config().group().shutdownGracefully(0, 0, MILLISECONDS);
-        Future<?> serverChildGroup = sb.config().childGroup().shutdownGracefully(0, 0, MILLISECONDS);
-        Future<?> clientGroup = cb.config().group().shutdownGracefully(0, 0, MILLISECONDS);
-        serverGroup.sync();
-        serverChildGroup.sync();
-        clientGroup.sync();
+        Future<?> serverGroup = sb.config().group().shutdownGracefully(0, 5, SECONDS);
+        Future<?> serverChildGroup = sb.config().childGroup().shutdownGracefully(0, 5, SECONDS);
+        Future<?> clientGroup = cb.config().group().shutdownGracefully(0, 5, SECONDS);
+        serverGroup.syncUninterruptibly();
+        serverChildGroup.syncUninterruptibly();
+        clientGroup.syncUninterruptibly();
     }
 
     @Test
@@ -541,7 +540,7 @@ public class HttpToHttp2ConnectionHandlerTest {
                 p.addLast(new ChannelInboundHandlerAdapter() {
                     @Override
                     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
-                        if (evt instanceof Http2ConnectionPrefaceWrittenEvent) {
+                        if (evt == Http2ConnectionPrefaceAndSettingsFrameWrittenEvent.INSTANCE) {
                             prefaceWrittenLatch.countDown();
                             ctx.pipeline().remove(this);
                         }

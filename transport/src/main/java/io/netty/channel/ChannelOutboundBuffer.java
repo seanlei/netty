@@ -622,12 +622,12 @@ public final class ChannelOutboundBuffer {
         }
     }
 
-    void close(final ClosedChannelException cause) {
+    void close(final Throwable cause, final boolean allowChannelOpen) {
         if (inFail) {
             channel.eventLoop().execute(new Runnable() {
                 @Override
                 public void run() {
-                    close(cause);
+                    close(cause, allowChannelOpen);
                 }
             });
             return;
@@ -635,7 +635,7 @@ public final class ChannelOutboundBuffer {
 
         inFail = true;
 
-        if (channel.isOpen()) {
+        if (!allowChannelOpen && channel.isOpen()) {
             throw new IllegalStateException("close() must be invoked after the channel is closed.");
         }
 
@@ -663,16 +663,20 @@ public final class ChannelOutboundBuffer {
         clearNioBuffers();
     }
 
+    void close(ClosedChannelException cause) {
+        close(cause, false);
+    }
+
     private static void safeSuccess(ChannelPromise promise) {
-        if (!(promise instanceof VoidChannelPromise)) {
-            PromiseNotificationUtil.trySuccess(promise, null, logger);
-        }
+        // Only log if the given promise is not of type VoidChannelPromise as trySuccess(...) is expected to return
+        // false.
+        PromiseNotificationUtil.trySuccess(promise, null, promise instanceof VoidChannelPromise ? null : logger);
     }
 
     private static void safeFail(ChannelPromise promise, Throwable cause) {
-        if (!(promise instanceof VoidChannelPromise)) {
-            PromiseNotificationUtil.tryFailure(promise, cause, logger);
-        }
+        // Only log if the given promise is not of type VoidChannelPromise as tryFailure(...) is expected to return
+        // false.
+        PromiseNotificationUtil.tryFailure(promise, cause, promise instanceof VoidChannelPromise ? null : logger);
     }
 
     @Deprecated

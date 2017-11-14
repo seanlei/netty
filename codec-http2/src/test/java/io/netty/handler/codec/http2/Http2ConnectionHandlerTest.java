@@ -43,6 +43,8 @@ import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.netty.buffer.Unpooled.copiedBuffer;
 import static io.netty.handler.codec.http2.Http2CodecUtil.connectionPrefaceBuf;
@@ -56,6 +58,7 @@ import static io.netty.util.CharsetUtil.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyInt;
@@ -214,6 +217,56 @@ public class Http2ConnectionHandlerTest {
         if (handler != null) {
             handler.handlerRemoved(ctx);
         }
+    }
+
+    @Test
+    public void onHttpServerUpgradeWithoutHandlerAdded() throws Exception {
+        handler = new Http2ConnectionHandlerBuilder().frameListener(new Http2FrameAdapter()).server(true).build();
+        try {
+            handler.onHttpServerUpgrade(new Http2Settings());
+            fail();
+        } catch (Http2Exception e) {
+            assertEquals(Http2Error.INTERNAL_ERROR, e.error());
+        }
+    }
+
+    @Test
+    public void onHttpClientUpgradeWithoutHandlerAdded() throws Exception {
+        handler = new Http2ConnectionHandlerBuilder().frameListener(new Http2FrameAdapter()).server(false).build();
+        try {
+            handler.onHttpClientUpgrade();
+            fail();
+        } catch (Http2Exception e) {
+            assertEquals(Http2Error.INTERNAL_ERROR, e.error());
+        }
+    }
+
+    @Test
+    public void clientShouldveSentPrefaceAndSettingsFrameWhenUserEventIsTriggered() throws Exception {
+        when(connection.isServer()).thenReturn(false);
+        when(channel.isActive()).thenReturn(false);
+        handler = newHandler();
+        when(channel.isActive()).thenReturn(true);
+
+        final Http2ConnectionPrefaceAndSettingsFrameWrittenEvent evt =
+                Http2ConnectionPrefaceAndSettingsFrameWrittenEvent.INSTANCE;
+
+        final AtomicBoolean verified = new AtomicBoolean(false);
+        final Answer verifier = new Answer() {
+            @Override
+            public Object answer(final InvocationOnMock in) throws Throwable {
+                assertTrue(in.getArgument(0).equals(evt));  // sanity check...
+                verify(ctx).write(eq(connectionPrefaceBuf()));
+                verify(encoder).writeSettings(eq(ctx), any(Http2Settings.class), any(ChannelPromise.class));
+                verified.set(true);
+                return null;
+            }
+        };
+
+        doAnswer(verifier).when(ctx).fireUserEventTriggered(evt);
+
+        handler.channelActive(ctx);
+        assertTrue(verified.get());
     }
 
     @Test
@@ -620,13 +673,30 @@ public class Http2ConnectionHandlerTest {
     }
 
     @Test
-    public void writeRstStreamForUnkownStreamUsingVoidPromise() throws Exception {
+    public void writeRstStreamForUnknownStreamUsingVoidPromise() throws Exception {
         writeRstStreamUsingVoidPromise(NON_EXISTANT_STREAM_ID);
     }
 
     @Test
     public void writeRstStreamForKnownStreamUsingVoidPromise() throws Exception {
         writeRstStreamUsingVoidPromise(STREAM_ID);
+    }
+
+    @Test
+    public void gracefulShutdownTimeoutTest() throws Exception {
+        handler = newHandler();
+        final long expectedMillis = 1234;
+        handler.gracefulShutdownTimeoutMillis(expectedMillis);
+        handler.close(ctx, promise);
+        verify(executor).schedule(any(Runnable.class), eq(expectedMillis), eq(TimeUnit.MILLISECONDS));
+    }
+
+    @Test
+    public void gracefulShutdownIndefiniteTimeoutTest() throws Exception {
+        handler = newHandler();
+        handler.gracefulShutdownTimeoutMillis(-1);
+        handler.close(ctx, promise);
+        verify(executor, never()).schedule(any(Runnable.class), anyLong(), any(TimeUnit.class));
     }
 
     private void writeRstStreamUsingVoidPromise(int streamId) throws Exception {

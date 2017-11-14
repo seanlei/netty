@@ -16,6 +16,7 @@
 
 package io.netty.buffer;
 
+import io.netty.util.NettyRuntime;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.PlatformDependent;
@@ -73,11 +74,14 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         // Assuming each arena has 3 chunks, the pool should not consume more than 50% of max memory.
         final Runtime runtime = Runtime.getRuntime();
 
-        // Use 2 * cores by default to reduce condition as we use 2 * cores for the number of EventLoops
-        // in NIO and EPOLL as well. If we choose a smaller number we will run into hotspots as allocation and
-        // deallocation needs to be synchronized on the PoolArena.
-        // See https://github.com/netty/netty/issues/3888
-        final int defaultMinNumArena = runtime.availableProcessors() * 2;
+        /*
+         * We use 2 * available processors by default to reduce contention as we use 2 * available processors for the
+         * number of EventLoops in NIO and EPOLL as well. If we choose a smaller number we will run into hot spots as
+         * allocation and de-allocation needs to be synchronized on the PoolArena.
+         *
+         * See https://github.com/netty/netty/issues/3888.
+         */
+        final int defaultMinNumArena = NettyRuntime.availableProcessors() * 2;
         final int defaultChunkSize = DEFAULT_PAGE_SIZE << DEFAULT_MAX_ORDER;
         DEFAULT_NUM_HEAP_ARENA = Math.max(0,
                 SystemPropertyUtil.getInt(
@@ -328,14 +332,14 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     /**
-     * Default number of heap areanas - System Property: io.netty.allocator.numHeapArenas - default 2 * cores
+     * Default number of heap arenas - System Property: io.netty.allocator.numHeapArenas - default 2 * cores
      */
     public static int defaultNumHeapArena() {
         return DEFAULT_NUM_HEAP_ARENA;
     }
 
     /**
-     * Default numer of direct arenas - System Property: io.netty.allocator.numDirectArenas - default 2 * cores
+     * Default number of direct arenas - System Property: io.netty.allocator.numDirectArenas - default 2 * cores
      */
     public static int defaultNumDirectArena() {
         return DEFAULT_NUM_DIRECT_ARENA;
@@ -353,6 +357,20 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
      */
     public static int defaultMaxOrder() {
         return DEFAULT_MAX_ORDER;
+    }
+
+    /**
+     * Default thread caching behavior - System Property: io.netty.allocator.useCacheForAllThreads - default true
+     */
+    public static boolean defaultUseCacheForAllThreads() {
+        return DEFAULT_USE_CACHE_FOR_ALL_THREADS;
+    }
+
+    /**
+     * Default prefer direct - System Property: io.netty.noPreferDirect - default false
+     */
+    public static boolean defaultPreferDirect() {
+        return PlatformDependent.directBufferPreferred();
     }
 
     /**
@@ -377,7 +395,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     /**
-     * Return {@code true} if direct memory cache aligment is supported, {@code false} otherwise.
+     * Return {@code true} if direct memory cache alignment is supported, {@code false} otherwise.
      */
     public static boolean isDirectMemoryCacheAlignmentSupported() {
         return PlatformDependent.hasUnsafe();

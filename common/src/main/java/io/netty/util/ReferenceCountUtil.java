@@ -26,6 +26,10 @@ public final class ReferenceCountUtil {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(ReferenceCountUtil.class);
 
+    static {
+        ResourceLeakDetector.addExclusions(ReferenceCountUtil.class, "touch");
+    }
+
     /**
      * Try to call {@link ReferenceCounted#retain()} if the specified message implements {@link ReferenceCounted}.
      * If the specified message doesn't implement {@link ReferenceCounted}, this method does nothing.
@@ -154,6 +158,14 @@ public final class ReferenceCountUtil {
             ThreadDeathWatcher.watch(Thread.currentThread(), new ReleasingTask((ReferenceCounted) msg, decrement));
         }
         return msg;
+    }
+
+    /**
+     * Returns reference count of a {@link ReferenceCounted} object. If object is not type of
+     * {@link ReferenceCounted}, {@code -1} is returned.
+     */
+    public static int refCnt(Object msg) {
+        return msg instanceof ReferenceCounted ? ((ReferenceCounted) msg).refCnt() : -1;
     }
 
     /**

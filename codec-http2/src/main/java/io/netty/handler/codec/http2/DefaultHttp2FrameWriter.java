@@ -48,8 +48,6 @@ import static io.netty.handler.codec.http2.Http2CodecUtil.WINDOW_UPDATE_FRAME_LE
 import static io.netty.handler.codec.http2.Http2CodecUtil.isMaxFrameSizeValid;
 import static io.netty.handler.codec.http2.Http2CodecUtil.verifyPadding;
 import static io.netty.handler.codec.http2.Http2CodecUtil.writeFrameHeaderInternal;
-import static io.netty.handler.codec.http2.Http2CodecUtil.writeUnsignedInt;
-import static io.netty.handler.codec.http2.Http2CodecUtil.writeUnsignedShort;
 import static io.netty.handler.codec.http2.Http2Error.FRAME_SIZE_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.connectionError;
 import static io.netty.handler.codec.http2.Http2FrameTypes.CONTINUATION;
@@ -88,12 +86,12 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
         this(new DefaultHttp2HeadersEncoder());
     }
 
-    public DefaultHttp2FrameWriter(SensitivityDetector headersSensativityDetector) {
-        this(new DefaultHttp2HeadersEncoder(headersSensativityDetector));
+    public DefaultHttp2FrameWriter(SensitivityDetector headersSensitivityDetector) {
+        this(new DefaultHttp2HeadersEncoder(headersSensitivityDetector));
     }
 
-    public DefaultHttp2FrameWriter(SensitivityDetector headersSensativityDetector, boolean ignoreMaxHeaderListSize) {
-        this(new DefaultHttp2HeadersEncoder(headersSensativityDetector, ignoreMaxHeaderListSize));
+    public DefaultHttp2FrameWriter(SensitivityDetector headersSensitivityDetector, boolean ignoreMaxHeaderListSize) {
+        this(new DefaultHttp2HeadersEncoder(headersSensitivityDetector, ignoreMaxHeaderListSize));
     }
 
     public DefaultHttp2FrameWriter(Http2HeadersEncoder headersEncoder) {
@@ -175,13 +173,18 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
                 }
             } while (!lastFrame);
         } catch (Throwable t) {
-            if (needToReleaseHeaders) {
-                header.release();
+            try {
+                if (needToReleaseHeaders) {
+                    header.release();
+                }
+                if (needToReleaseData) {
+                    data.release();
+                }
+            } finally {
+                promiseAggregator.setFailure(t);
+                promiseAggregator.doneAllocatingPromises();
             }
-            if (needToReleaseData) {
-                data.release();
-            }
-            promiseAggregator.setFailure(t);
+            return promiseAggregator;
         }
         return promiseAggregator.doneAllocatingPromises();
     }
@@ -211,8 +214,7 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
 
             ByteBuf buf = ctx.alloc().buffer(PRIORITY_FRAME_LENGTH);
             writeFrameHeaderInternal(buf, PRIORITY_ENTRY_LENGTH, PRIORITY, new Http2Flags(), streamId);
-            long word1 = exclusive ? 0x80000000L | streamDependency : streamDependency;
-            writeUnsignedInt(word1, buf);
+            buf.writeInt(exclusive ? (int) (0x80000000L | streamDependency) : streamDependency);
             // Adjust the weight so that it fits into a single byte on the wire.
             buf.writeByte(weight - 1);
             return ctx.write(buf, promise);
@@ -230,7 +232,7 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
 
             ByteBuf buf = ctx.alloc().buffer(RST_STREAM_FRAME_LENGTH);
             writeFrameHeaderInternal(buf, INT_FIELD_LENGTH, RST_STREAM, new Http2Flags(), streamId);
-            writeUnsignedInt(errorCode, buf);
+            buf.writeInt((int) errorCode);
             return ctx.write(buf, promise);
         } catch (Throwable t) {
             return promise.setFailure(t);
@@ -246,8 +248,8 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
             ByteBuf buf = ctx.alloc().buffer(FRAME_HEADER_LENGTH + settings.size() * SETTING_ENTRY_LENGTH);
             writeFrameHeaderInternal(buf, payloadLength, SETTINGS, new Http2Flags(), 0);
             for (Http2Settings.PrimitiveEntry<Long> entry : settings.entries()) {
-                writeUnsignedShort(entry.key(), buf);
-                writeUnsignedInt(entry.value(), buf);
+                buf.writeChar(entry.key());
+                buf.writeInt(entry.value().intValue());
             }
             return ctx.write(buf, promise);
         } catch (Throwable t) {
@@ -267,27 +269,35 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
     }
 
     @Override
-    public ChannelFuture writePing(ChannelHandlerContext ctx, boolean ack, ByteBuf data,
-            ChannelPromise promise) {
-        boolean releaseData = true;
-        SimpleChannelPromiseAggregator promiseAggregator =
+    public ChannelFuture writePing(ChannelHandlerContext ctx, boolean ack, ByteBuf data, ChannelPromise promise) {
+        final SimpleChannelPromiseAggregator promiseAggregator =
                 new SimpleChannelPromiseAggregator(promise, ctx.channel(), ctx.executor());
         try {
             verifyPingPayload(data);
             Http2Flags flags = ack ? new Http2Flags().ack(true) : new Http2Flags();
+            int payloadLength = data.readableBytes();
             ByteBuf buf = ctx.alloc().buffer(FRAME_HEADER_LENGTH);
-            writeFrameHeaderInternal(buf, data.readableBytes(), PING, flags, 0);
+            // Assume nothing below will throw until buf is written. That way we don't have to take care of ownership
+            // in the catch block.
+            writeFrameHeaderInternal(buf, payloadLength, PING, flags, 0);
             ctx.write(buf, promiseAggregator.newPromise());
+        } catch (Throwable t) {
+            try {
+                data.release();
+            } finally {
+                promiseAggregator.setFailure(t);
+                promiseAggregator.doneAllocatingPromises();
+            }
+            return promiseAggregator;
+        }
 
+        try {
             // Write the debug data.
-            releaseData = false;
             ctx.write(data, promiseAggregator.newPromise());
         } catch (Throwable t) {
-            if (releaseData) {
-                data.release();
-            }
             promiseAggregator.setFailure(t);
         }
+
         return promiseAggregator.doneAllocatingPromises();
     }
 
@@ -352,7 +362,6 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
     @Override
     public ChannelFuture writeGoAway(ChannelHandlerContext ctx, int lastStreamId, long errorCode,
             ByteBuf debugData, ChannelPromise promise) {
-        boolean releaseData = true;
         SimpleChannelPromiseAggregator promiseAggregator =
                 new SimpleChannelPromiseAggregator(promise, ctx.channel(), ctx.executor());
         try {
@@ -361,17 +370,25 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
 
             int payloadLength = 8 + debugData.readableBytes();
             ByteBuf buf = ctx.alloc().buffer(GO_AWAY_FRAME_HEADER_LENGTH);
+            // Assume nothing below will throw until buf is written. That way we don't have to take care of ownership
+            // in the catch block.
             writeFrameHeaderInternal(buf, payloadLength, GO_AWAY, new Http2Flags(), 0);
             buf.writeInt(lastStreamId);
-            writeUnsignedInt(errorCode, buf);
+            buf.writeInt((int) errorCode);
             ctx.write(buf, promiseAggregator.newPromise());
+        } catch (Throwable t) {
+            try {
+                debugData.release();
+            } finally {
+                promiseAggregator.setFailure(t);
+                promiseAggregator.doneAllocatingPromises();
+            }
+            return promiseAggregator;
+        }
 
-            releaseData = false;
+        try {
             ctx.write(debugData, promiseAggregator.newPromise());
         } catch (Throwable t) {
-            if (releaseData) {
-                debugData.release();
-            }
             promiseAggregator.setFailure(t);
         }
         return promiseAggregator.doneAllocatingPromises();
@@ -396,21 +413,27 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
     @Override
     public ChannelFuture writeFrame(ChannelHandlerContext ctx, byte frameType, int streamId,
             Http2Flags flags, ByteBuf payload, ChannelPromise promise) {
-        boolean releaseData = true;
         SimpleChannelPromiseAggregator promiseAggregator =
                 new SimpleChannelPromiseAggregator(promise, ctx.channel(), ctx.executor());
         try {
             verifyStreamOrConnectionId(streamId, STREAM_ID);
             ByteBuf buf = ctx.alloc().buffer(FRAME_HEADER_LENGTH);
+            // Assume nothing below will throw until buf is written. That way we don't have to take care of ownership
+            // in the catch block.
             writeFrameHeaderInternal(buf, payload.readableBytes(), frameType, flags, streamId);
             ctx.write(buf, promiseAggregator.newPromise());
-
-            releaseData = false;
+        } catch (Throwable t) {
+            try {
+                payload.release();
+            } finally {
+                promiseAggregator.setFailure(t);
+                promiseAggregator.doneAllocatingPromises();
+            }
+            return promiseAggregator;
+        }
+        try {
             ctx.write(payload, promiseAggregator.newPromise());
         } catch (Throwable t) {
-            if (releaseData) {
-                payload.release();
-            }
             promiseAggregator.setFailure(t);
         }
         return promiseAggregator.doneAllocatingPromises();
@@ -451,8 +474,7 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
             writePaddingLength(buf, padding);
 
             if (hasPriority) {
-                long word1 = exclusive ? 0x80000000L | streamDependency : streamDependency;
-                writeUnsignedInt(word1, buf);
+                buf.writeInt(exclusive ? (int) (0x80000000L | streamDependency) : streamDependency);
 
                 // Adjust the weight so that it fits into a single byte on the wire.
                 buf.writeByte(weight - 1);

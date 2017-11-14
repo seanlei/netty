@@ -18,23 +18,36 @@ package io.netty.handler.ssl;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
-import io.netty.util.ReferenceCountUtil;
-import io.netty.util.ReferenceCounted;
-import io.netty.util.internal.NativeLibraryLoader;
-import io.netty.util.internal.SystemPropertyUtil;
-import io.netty.util.internal.logging.InternalLogger;
-import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.internal.tcnative.Buffer;
 import io.netty.internal.tcnative.Library;
 import io.netty.internal.tcnative.SSL;
 import io.netty.internal.tcnative.SSLContext;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.ReferenceCounted;
+import io.netty.util.internal.NativeLibraryLoader;
+import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.SystemPropertyUtil;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.security.AccessController;
 import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
-import java.util.Locale;
+import java.util.List;
 import java.util.Set;
+
+import static io.netty.handler.ssl.SslUtils.DEFAULT_CIPHER_SUITES;
+import static io.netty.handler.ssl.SslUtils.addIfSupported;
+import static io.netty.handler.ssl.SslUtils.useFallbackCiphersIfDefaultIsEmpty;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_SSL_V2;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_SSL_V2_HELLO;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_SSL_V3;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_TLS_V1;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_TLS_V1_1;
+import static io.netty.handler.ssl.SslUtils.PROTOCOL_TLS_V1_2;
 
 /**
  * Tells if <a href="http://netty.io/wiki/forked-tomcat-native.html">{@code netty-tcnative}</a> and its OpenSSL support
@@ -43,24 +56,16 @@ import java.util.Set;
 public final class OpenSsl {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(OpenSsl.class);
-    private static final String LINUX = "linux";
-    private static final String UNKNOWN = "unknown";
     private static final Throwable UNAVAILABILITY_CAUSE;
 
+    static final List<String> DEFAULT_CIPHERS;
     static final Set<String> AVAILABLE_CIPHER_SUITES;
     private static final Set<String> AVAILABLE_OPENSSL_CIPHER_SUITES;
     private static final Set<String> AVAILABLE_JAVA_CIPHER_SUITES;
     private static final boolean SUPPORTS_KEYMANAGER_FACTORY;
     private static final boolean SUPPORTS_HOSTNAME_VALIDATION;
     private static final boolean USE_KEYMANAGER_FACTORY;
-
-    // Protocols
-    static final String PROTOCOL_SSL_V2_HELLO = "SSLv2Hello";
-    static final String PROTOCOL_SSL_V2 = "SSLv2";
-    static final String PROTOCOL_SSL_V3 = "SSLv3";
-    static final String PROTOCOL_TLS_V1 = "TLSv1";
-    static final String PROTOCOL_TLS_V1_1 = "TLSv1.1";
-    static final String PROTOCOL_TLS_V1_2 = "TLSv1.2";
+    private static final boolean SUPPORTS_OCSP;
 
     static final Set<String> SUPPORTED_PROTOCOLS_SET;
 
@@ -114,14 +119,15 @@ public final class OpenSsl {
         if (cause == null) {
             logger.debug("netty-tcnative using native library: {}", SSL.versionString());
 
+            final List<String> defaultCiphers = new ArrayList<String>();
             final Set<String> availableOpenSslCipherSuites = new LinkedHashSet<String>(128);
             boolean supportsKeyManagerFactory = false;
             boolean useKeyManagerFactory = false;
             boolean supportsHostNameValidation = false;
             try {
                 final long sslCtx = SSLContext.make(SSL.SSL_PROTOCOL_ALL, SSL.SSL_MODE_SERVER);
-                long privateKeyBio = 0;
                 long certBio = 0;
+                SelfSignedCertificate cert = null;
                 try {
                     SSLContext.setCipherSuite(sslCtx, "ALL");
                     final long ssl = SSL.newSSL(sslCtx, true);
@@ -133,6 +139,7 @@ public final class OpenSsl {
                             }
                             availableOpenSslCipherSuites.add(c);
                         }
+
                         try {
                             SSL.setHostNameValidation(ssl, 0, "netty.io");
                             supportsHostNameValidation = true;
@@ -140,7 +147,7 @@ public final class OpenSsl {
                             logger.debug("Hostname Verification not supported.");
                         }
                         try {
-                            SelfSignedCertificate cert = new SelfSignedCertificate();
+                            cert = new SelfSignedCertificate();
                             certBio = ReferenceCountedOpenSslContext.toBIO(cert.cert());
                             SSL.setCertificateChainBio(ssl, certBio, false);
                             supportsKeyManagerFactory = true;
@@ -160,11 +167,11 @@ public final class OpenSsl {
                         }
                     } finally {
                         SSL.freeSSL(ssl);
-                        if (privateKeyBio != 0) {
-                            SSL.freeBIO(privateKeyBio);
-                        }
                         if (certBio != 0) {
                             SSL.freeBIO(certBio);
+                        }
+                        if (cert != null) {
+                            cert.delete();
                         }
                     }
                 } finally {
@@ -174,7 +181,6 @@ public final class OpenSsl {
                 logger.warn("Failed to get the list of available OpenSSL cipher suites.", e);
             }
             AVAILABLE_OPENSSL_CIPHER_SUITES = Collections.unmodifiableSet(availableOpenSslCipherSuites);
-
             final Set<String> availableJavaCipherSuites = new LinkedHashSet<String>(
                     AVAILABLE_OPENSSL_CIPHER_SUITES.size() * 2);
             for (String cipher: AVAILABLE_OPENSSL_CIPHER_SUITES) {
@@ -182,16 +188,18 @@ public final class OpenSsl {
                 availableJavaCipherSuites.add(CipherSuiteConverter.toJava(cipher, "TLS"));
                 availableJavaCipherSuites.add(CipherSuiteConverter.toJava(cipher, "SSL"));
             }
+
+            useFallbackCiphersIfDefaultIsEmpty(defaultCiphers, availableJavaCipherSuites);
+            DEFAULT_CIPHERS = Collections.unmodifiableList(defaultCiphers);
+            addIfSupported(availableJavaCipherSuites, defaultCiphers, DEFAULT_CIPHER_SUITES);
+
             AVAILABLE_JAVA_CIPHER_SUITES = Collections.unmodifiableSet(availableJavaCipherSuites);
 
             final Set<String> availableCipherSuites = new LinkedHashSet<String>(
                     AVAILABLE_OPENSSL_CIPHER_SUITES.size() + AVAILABLE_JAVA_CIPHER_SUITES.size());
-            for (String cipher: AVAILABLE_OPENSSL_CIPHER_SUITES) {
-                availableCipherSuites.add(cipher);
-            }
-            for (String cipher: AVAILABLE_JAVA_CIPHER_SUITES) {
-                availableCipherSuites.add(cipher);
-            }
+            availableCipherSuites.addAll(AVAILABLE_OPENSSL_CIPHER_SUITES);
+            availableCipherSuites.addAll(AVAILABLE_JAVA_CIPHER_SUITES);
+
             AVAILABLE_CIPHER_SUITES = availableCipherSuites;
             SUPPORTS_KEYMANAGER_FACTORY = supportsKeyManagerFactory;
             SUPPORTS_HOSTNAME_VALIDATION = supportsHostNameValidation;
@@ -217,7 +225,14 @@ public final class OpenSsl {
             }
 
             SUPPORTED_PROTOCOLS_SET = Collections.unmodifiableSet(protocols);
+            SUPPORTS_OCSP = doesSupportOcsp();
+
+            if (logger.isDebugEnabled()) {
+                logger.debug("Supported protocols (OpenSSL): {} ", Arrays.asList(SUPPORTED_PROTOCOLS_SET));
+                logger.debug("Default cipher suites (OpenSSL): {}", DEFAULT_CIPHERS);
+            }
         } else {
+            DEFAULT_CIPHERS = Collections.emptyList();
             AVAILABLE_OPENSSL_CIPHER_SUITES = Collections.emptySet();
             AVAILABLE_JAVA_CIPHER_SUITES = Collections.emptySet();
             AVAILABLE_CIPHER_SUITES = Collections.emptySet();
@@ -225,9 +240,28 @@ public final class OpenSsl {
             SUPPORTS_HOSTNAME_VALIDATION = false;
             USE_KEYMANAGER_FACTORY = false;
             SUPPORTED_PROTOCOLS_SET = Collections.emptySet();
+            SUPPORTS_OCSP = false;
         }
     }
 
+    private static boolean doesSupportOcsp() {
+        boolean supportsOcsp = false;
+        if (version() >= 0x10002000L) {
+            long sslCtx = -1;
+            try {
+                sslCtx = SSLContext.make(SSL.SSL_PROTOCOL_TLSV1_2, SSL.SSL_MODE_SERVER);
+                SSLContext.enableOcsp(sslCtx, false);
+                supportsOcsp = true;
+            } catch (Exception ignore) {
+                // ignore
+            } finally {
+                if (sslCtx != -1) {
+                    SSLContext.free(sslCtx);
+                }
+            }
+        }
+        return supportsOcsp;
+    }
     private static boolean doesSupportProtocol(int protocol) {
         long sslCtx = -1;
         try {
@@ -260,14 +294,18 @@ public final class OpenSsl {
     }
 
     /**
+     * Returns {@code true} if the used version of OpenSSL supports OCSP stapling.
+     */
+    public static boolean isOcspSupported() {
+      return SUPPORTS_OCSP;
+    }
+
+    /**
      * Returns the version of the used available OpenSSL library or {@code -1} if {@link #isAvailable()}
      * returns {@code false}.
      */
     public static int version() {
-        if (isAvailable()) {
-            return SSL.version();
-        }
-        return -1;
+        return isAvailable() ? SSL.version() : -1;
     }
 
     /**
@@ -275,10 +313,7 @@ public final class OpenSsl {
      * returns {@code false}.
      */
     public static String versionString() {
-        if (isAvailable()) {
-            return SSL.versionString();
-        }
-        return null;
+        return isAvailable() ? SSL.versionString() : null;
     }
 
     /**
@@ -367,19 +402,21 @@ public final class OpenSsl {
     private OpenSsl() { }
 
     private static void loadTcNative() throws Exception {
-        String os = normalizeOs(SystemPropertyUtil.get("os.name", ""));
-        String arch = normalizeArch(SystemPropertyUtil.get("os.arch", ""));
+        String os = PlatformDependent.normalizedOs();
+        String arch = PlatformDependent.normalizedArch();
 
-        Set<String> libNames = new LinkedHashSet<String>(3);
+        Set<String> libNames = new LinkedHashSet<String>(4);
+        String staticLibName = "netty_tcnative";
+
         // First, try loading the platform-specific library. Platform-specific
         // libraries will be available if using a tcnative uber jar.
-        libNames.add("netty-tcnative-" + os + '-' + arch);
-        if (LINUX.equalsIgnoreCase(os)) {
+        libNames.add(staticLibName + "_" + os + '_' + arch);
+        if ("linux".equalsIgnoreCase(os)) {
             // Fedora SSL lib so naming (libssl.so.10 vs libssl.so.1.0.0)..
-            libNames.add("netty-tcnative-" + os + '-' + arch + "-fedora");
+            libNames.add(staticLibName + "_" + os + '_' + arch + "_fedora");
         }
-        // finally the default library.
-        libNames.add("netty-tcnative");
+        libNames.add(staticLibName + "_" + arch);
+        libNames.add(staticLibName);
 
         NativeLibraryLoader.loadFirstAvailable(SSL.class.getClassLoader(),
             libNames.toArray(new String[libNames.size()]));
@@ -387,91 +424,6 @@ public final class OpenSsl {
 
     private static boolean initializeTcNative() throws Exception {
         return Library.initialize();
-    }
-
-    private static String normalizeOs(String value) {
-        value = normalize(value);
-        if (value.startsWith("aix")) {
-            return "aix";
-        }
-        if (value.startsWith("hpux")) {
-            return "hpux";
-        }
-        if (value.startsWith("os400")) {
-            // Avoid the names such as os4000
-            if (value.length() <= 5 || !Character.isDigit(value.charAt(5))) {
-                return "os400";
-            }
-        }
-        if (value.startsWith(LINUX)) {
-            return LINUX;
-        }
-        if (value.startsWith("macosx") || value.startsWith("osx")) {
-            return "osx";
-        }
-        if (value.startsWith("freebsd")) {
-            return "freebsd";
-        }
-        if (value.startsWith("openbsd")) {
-            return "openbsd";
-        }
-        if (value.startsWith("netbsd")) {
-            return "netbsd";
-        }
-        if (value.startsWith("solaris") || value.startsWith("sunos")) {
-            return "sunos";
-        }
-        if (value.startsWith("windows")) {
-            return "windows";
-        }
-
-        return UNKNOWN;
-    }
-
-    private static String normalizeArch(String value) {
-        value = normalize(value);
-        if (value.matches("^(x8664|amd64|ia32e|em64t|x64)$")) {
-            return "x86_64";
-        }
-        if (value.matches("^(x8632|x86|i[3-6]86|ia32|x32)$")) {
-            return "x86_32";
-        }
-        if (value.matches("^(ia64|itanium64)$")) {
-            return "itanium_64";
-        }
-        if (value.matches("^(sparc|sparc32)$")) {
-            return "sparc_32";
-        }
-        if (value.matches("^(sparcv9|sparc64)$")) {
-            return "sparc_64";
-        }
-        if (value.matches("^(arm|arm32)$")) {
-            return "arm_32";
-        }
-        if ("aarch64".equals(value)) {
-            return "aarch_64";
-        }
-        if (value.matches("^(ppc|ppc32)$")) {
-            return "ppc_32";
-        }
-        if ("ppc64".equals(value)) {
-            return "ppc_64";
-        }
-        if ("ppc64le".equals(value)) {
-            return "ppcle_64";
-        }
-        if ("s390".equals(value)) {
-            return "s390_32";
-        }
-        if ("s390x".equals(value)) {
-            return "s390_64";
-        }
-
-        return UNKNOWN;
-    }
-
-    private static String normalize(String value) {
-        return value.toLowerCase(Locale.US).replaceAll("[^a-z0-9]+", "");
     }
 
     static void releaseIfNeeded(ReferenceCounted counted) {

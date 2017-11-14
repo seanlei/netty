@@ -29,23 +29,24 @@ import javax.net.ssl.SSLException;
 public abstract class OpenSslContext extends ReferenceCountedOpenSslContext {
     OpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, ApplicationProtocolConfig apnCfg,
                    long sessionCacheSize, long sessionTimeout, int mode, Certificate[] keyCertChain,
-                   ClientAuth clientAuth, String[] protocols, boolean startTls)
+                   ClientAuth clientAuth, String[] protocols, boolean startTls, boolean enableOcsp)
             throws SSLException {
         super(ciphers, cipherFilter, apnCfg, sessionCacheSize, sessionTimeout, mode, keyCertChain,
-                clientAuth, protocols, startTls, false);
+                clientAuth, protocols, startTls, enableOcsp, false);
     }
 
     OpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
                    OpenSslApplicationProtocolNegotiator apn, long sessionCacheSize,
                    long sessionTimeout, int mode, Certificate[] keyCertChain,
-                   ClientAuth clientAuth, String[] protocols, boolean startTls) throws SSLException {
+                   ClientAuth clientAuth, String[] protocols, boolean startTls,
+                   boolean enableOcsp) throws SSLException {
         super(ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, mode, keyCertChain, clientAuth, protocols,
-                startTls, false);
+                startTls, enableOcsp, false);
     }
 
     @Override
-    final SSLEngine newEngine0(ByteBufAllocator alloc, String peerHost, int peerPort) {
-        return new OpenSslEngine(this, alloc, peerHost, peerPort);
+    final SSLEngine newEngine0(ByteBufAllocator alloc, String peerHost, int peerPort, boolean jdkCompatibilityMode) {
+        return new OpenSslEngine(this, alloc, peerHost, peerPort, jdkCompatibilityMode);
     }
 
     @Override

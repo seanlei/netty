@@ -17,9 +17,6 @@ package io.netty.channel.epoll;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.ByteBufUtil;
-import io.netty.buffer.CompositeByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelConfig;
 import io.netty.channel.ChannelFuture;
@@ -28,17 +25,19 @@ import io.netty.channel.ChannelMetadata;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
-import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.EventLoop;
 import io.netty.channel.FileRegion;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.DuplexChannel;
 import io.netty.channel.unix.FileDescriptor;
-import io.netty.channel.unix.Socket;
+import io.netty.channel.unix.IovArray;
+import io.netty.channel.unix.SocketWritableByteChannel;
+import io.netty.channel.unix.UnixChannelUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.ThrowableUtil;
+import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -46,12 +45,9 @@ import java.io.IOException;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
-import java.nio.channels.ConnectionPendingException;
 import java.nio.channels.WritableByteChannel;
 import java.util.Queue;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 
 import static io.netty.channel.unix.FileDescriptor.pipe;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
@@ -62,8 +58,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             " (expected: " + StringUtil.simpleClassName(ByteBuf.class) + ", " +
                     StringUtil.simpleClassName(DefaultFileRegion.class) + ')';
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AbstractEpollStreamChannel.class);
-    private static final ClosedChannelException DO_CLOSE_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
-            new ClosedChannelException(), AbstractEpollStreamChannel.class, "doClose()");
     private static final ClosedChannelException CLEAR_SPLICE_QUEUE_CLOSED_CHANNEL_EXCEPTION =
             ThrowableUtil.unknownStackTrace(new ClosedChannelException(),
                     AbstractEpollStreamChannel.class, "clearSpliceQueue()");
@@ -74,13 +68,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             ThrowableUtil.unknownStackTrace(new ClosedChannelException(),
             AbstractEpollStreamChannel.class, "failSpliceIfClosed(...)");
 
-    /**
-     * The future of the current connection attempt.  If not null, subsequent
-     * connection attempts will fail.
-     */
-    private ChannelPromise connectPromise;
-    private ScheduledFuture<?> connectTimeoutFuture;
-    private SocketAddress requestedRemoteAddress;
     private Queue<SpliceInTask> spliceQueue;
 
     // Lazy init these if we need to splice(...)
@@ -89,45 +76,31 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
 
     private WritableByteChannel byteChannel;
 
-    /**
-     * @deprecated Use {@link #AbstractEpollStreamChannel(Channel, Socket)}.
-     */
-    @Deprecated
     protected AbstractEpollStreamChannel(Channel parent, int fd) {
-        this(parent, new Socket(fd));
+        this(parent, new LinuxSocket(fd));
     }
 
-    /**
-     * @deprecated Use {@link #AbstractEpollStreamChannel(Socket, boolean)}.
-     */
-    @Deprecated
     protected AbstractEpollStreamChannel(int fd) {
-        this(new Socket(fd));
+        this(new LinuxSocket(fd));
     }
 
-    /**
-     * @deprecated Use {@link #AbstractEpollStreamChannel(Socket, boolean)}.
-     */
-    @Deprecated
-    protected AbstractEpollStreamChannel(FileDescriptor fd) {
-        this(new Socket(fd.intValue()));
-    }
-
-    /**
-     * @deprecated Use {@link #AbstractEpollStreamChannel(Socket, boolean)}.
-     */
-    @Deprecated
-    protected AbstractEpollStreamChannel(Socket fd) {
+    AbstractEpollStreamChannel(LinuxSocket fd) {
         this(fd, isSoErrorZero(fd));
     }
 
-    protected AbstractEpollStreamChannel(Channel parent, Socket fd) {
+    AbstractEpollStreamChannel(Channel parent, LinuxSocket fd) {
         super(parent, fd, Native.EPOLLIN, true);
         // Add EPOLLRDHUP so we are notified once the remote peer close the connection.
         flags |= Native.EPOLLRDHUP;
     }
 
-    protected AbstractEpollStreamChannel(Socket fd, boolean active) {
+    AbstractEpollStreamChannel(Channel parent, LinuxSocket fd, SocketAddress remote) {
+        super(parent, fd, Native.EPOLLIN, remote);
+        // Add EPOLLRDHUP so we are notified once the remote peer close the connection.
+        flags |= Native.EPOLLRDHUP;
+    }
+
+    protected AbstractEpollStreamChannel(LinuxSocket fd, boolean active) {
         super(null, fd, Native.EPOLLIN, active);
         // Add EPOLLRDHUP so we are notified once the remote peer close the connection.
         flags |= Native.EPOLLRDHUP;
@@ -301,8 +274,8 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         boolean done = false;
         int offset = 0;
         int end = offset + cnt;
-        for (int i = writeSpinCount - 1; i >= 0; i--) {
-            long localWrittenBytes = fd().writevAddresses(array.memoryAddress(offset), cnt);
+        for (int i = writeSpinCount; i > 0; --i) {
+            long localWrittenBytes = socket.writevAddresses(array.memoryAddress(offset), cnt);
             if (localWrittenBytes == 0) {
                 break;
             }
@@ -340,8 +313,8 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         boolean done = false;
         int offset = 0;
         int end = offset + nioBufferCnt;
-        for (int i = writeSpinCount - 1; i >= 0; i--) {
-            long localWrittenBytes = fd().writev(nioBuffers, offset, nioBufferCnt);
+        for (int i = writeSpinCount; i > 0; --i) {
+            long localWrittenBytes = socket.writev(nioBuffers, offset, nioBufferCnt);
             if (localWrittenBytes == 0) {
                 break;
             }
@@ -390,10 +363,10 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         boolean done = false;
         long flushedAmount = 0;
 
-        for (int i = writeSpinCount - 1; i >= 0; i--) {
+        for (int i = writeSpinCount; i > 0; --i) {
             final long offset = region.transferred();
             final long localFlushedAmount =
-                    Native.sendfile(fd().intValue(), region, baseOffset, offset, regionCount - offset);
+                    Native.sendfile(socket.intValue(), region, baseOffset, offset, regionCount - offset);
             if (localFlushedAmount == 0) {
                 break;
             }
@@ -426,9 +399,9 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         long flushedAmount = 0;
 
         if (byteChannel == null) {
-            byteChannel = new SocketWritableByteChannel();
+            byteChannel = new EpollSocketWritableByteChannel();
         }
-        for (int i = writeSpinCount - 1; i >= 0; i--) {
+        for (int i = writeSpinCount; i > 0; --i) {
             final long localFlushedAmount = region.transferTo(byteChannel, region.transferred());
             if (localFlushedAmount == 0) {
                 break;
@@ -559,24 +532,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
     protected Object filterOutboundMessage(Object msg) {
         if (msg instanceof ByteBuf) {
             ByteBuf buf = (ByteBuf) msg;
-            if (!buf.hasMemoryAddress() && (PlatformDependent.hasUnsafe() || !buf.isDirect())) {
-                if (buf instanceof CompositeByteBuf) {
-                    // Special handling of CompositeByteBuf to reduce memory copies if some of the Components
-                    // in the CompositeByteBuf are backed by a memoryAddress.
-                    CompositeByteBuf comp = (CompositeByteBuf) buf;
-                    if (!comp.isDirect() || comp.nioBufferCount() > Native.IOV_MAX) {
-                        // more then 1024 buffers for gathering writes so just do a memory copy.
-                        buf = newDirectBuffer(buf);
-                        assert buf.hasMemoryAddress();
-                    }
-                } else {
-                    // We can only handle buffers with memory address so we need to copy if a non direct is
-                    // passed to write.
-                    buf = newDirectBuffer(buf);
-                    assert buf.hasMemoryAddress();
-                }
-            }
-            return buf;
+            return UnixChannelUtil.isBufferCopyNeededForWrite(buf)? newDirectBuffer(buf): buf;
         }
 
         if (msg instanceof FileRegion || msg instanceof SpliceOutTask) {
@@ -587,27 +543,15 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                 "unsupported message type: " + StringUtil.simpleClassName(msg) + EXPECTED_TYPES);
     }
 
-    private void shutdownOutput0(final ChannelPromise promise) {
-        try {
-            fd().shutdown(false, true);
-            promise.setSuccess();
-        } catch (Throwable cause) {
-            promise.setFailure(cause);
-        }
+    @UnstableApi
+    @Override
+    protected final void doShutdownOutput() throws Exception {
+        socket.shutdown(false, true);
     }
 
     private void shutdownInput0(final ChannelPromise promise) {
         try {
-            fd().shutdown(true, false);
-            promise.setSuccess();
-        } catch (Throwable cause) {
-            promise.setFailure(cause);
-        }
-    }
-
-    private void shutdown0(final ChannelPromise promise) {
-        try {
-            fd().shutdown(true, true);
+            socket.shutdown(true, false);
             promise.setSuccess();
         } catch (Throwable cause) {
             promise.setFailure(cause);
@@ -616,17 +560,17 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
 
     @Override
     public boolean isOutputShutdown() {
-        return fd().isOutputShutdown();
+        return socket.isOutputShutdown();
     }
 
     @Override
     public boolean isInputShutdown() {
-        return fd().isInputShutdown();
+        return socket.isInputShutdown();
     }
 
     @Override
     public boolean isShutdown() {
-        return fd().isShutdown();
+        return socket.isShutdown();
     }
 
     @Override
@@ -636,27 +580,18 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
 
     @Override
     public ChannelFuture shutdownOutput(final ChannelPromise promise) {
-        Executor closeExecutor = ((EpollStreamUnsafe) unsafe()).prepareToClose();
-        if (closeExecutor != null) {
-            closeExecutor.execute(new Runnable() {
+        EventLoop loop = eventLoop();
+        if (loop.inEventLoop()) {
+            ((AbstractUnsafe) unsafe()).shutdownOutput(promise);
+        } else {
+            loop.execute(new Runnable() {
                 @Override
                 public void run() {
-                    shutdownOutput0(promise);
+                    ((AbstractUnsafe) unsafe()).shutdownOutput(promise);
                 }
             });
-        } else {
-            EventLoop loop = eventLoop();
-            if (loop.inEventLoop()) {
-                shutdownOutput0(promise);
-            } else {
-                loop.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        shutdownOutput0(promise);
-                    }
-                });
-            }
         }
+
         return promise;
     }
 
@@ -698,46 +633,56 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
 
     @Override
     public ChannelFuture shutdown(final ChannelPromise promise) {
-        Executor closeExecutor = ((EpollStreamUnsafe) unsafe()).prepareToClose();
-        if (closeExecutor != null) {
-            closeExecutor.execute(new Runnable() {
+        ChannelFuture shutdownOutputFuture = shutdownOutput();
+        if (shutdownOutputFuture.isDone()) {
+            shutdownOutputDone(shutdownOutputFuture, promise);
+        } else {
+            shutdownOutputFuture.addListener(new ChannelFutureListener() {
                 @Override
-                public void run() {
-                    shutdown0(promise);
+                public void operationComplete(final ChannelFuture shutdownOutputFuture) throws Exception {
+                    shutdownOutputDone(shutdownOutputFuture, promise);
                 }
             });
-        } else {
-            EventLoop loop = eventLoop();
-            if (loop.inEventLoop()) {
-                shutdown0(promise);
-            } else {
-                loop.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        shutdown0(promise);
-                    }
-                });
-            }
         }
         return promise;
+    }
+
+    private void shutdownOutputDone(final ChannelFuture shutdownOutputFuture, final ChannelPromise promise) {
+        ChannelFuture shutdownInputFuture = shutdownInput();
+        if (shutdownInputFuture.isDone()) {
+            shutdownDone(shutdownOutputFuture, shutdownInputFuture, promise);
+        } else {
+            shutdownInputFuture.addListener(new ChannelFutureListener() {
+                @Override
+                public void operationComplete(ChannelFuture shutdownInputFuture) throws Exception {
+                    shutdownDone(shutdownOutputFuture, shutdownInputFuture, promise);
+                }
+            });
+        }
+    }
+
+    private static void shutdownDone(ChannelFuture shutdownOutputFuture,
+                              ChannelFuture shutdownInputFuture,
+                              ChannelPromise promise) {
+        Throwable shutdownOutputCause = shutdownOutputFuture.cause();
+        Throwable shutdownInputCause = shutdownInputFuture.cause();
+        if (shutdownOutputCause != null) {
+            if (shutdownInputCause != null) {
+                logger.debug("Exception suppressed because a previous exception occurred.",
+                        shutdownInputCause);
+            }
+            promise.setFailure(shutdownOutputCause);
+        } else if (shutdownInputCause != null) {
+            promise.setFailure(shutdownInputCause);
+        } else {
+            promise.setSuccess();
+        }
     }
 
     @Override
     protected void doClose() throws Exception {
         try {
-            ChannelPromise promise = connectPromise;
-            if (promise != null) {
-                // Use tryFailure() instead of setFailure() to avoid the race against cancel().
-                promise.tryFailure(DO_CLOSE_CLOSED_CHANNEL_EXCEPTION);
-                connectPromise = null;
-            }
-
-            ScheduledFuture<?> future = connectTimeoutFuture;
-            if (future != null) {
-                future.cancel(false);
-                connectTimeoutFuture = null;
-            }
-            // Calling super.doClose() first so splceTo(...) will fail on next call.
+            // Calling super.doClose() first so spliceTo(...) will fail on next call.
             super.doClose();
         } finally {
             safeClosePipe(pipeIn);
@@ -756,29 +701,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                 break;
             }
             task.promise.tryFailure(CLEAR_SPLICE_QUEUE_CLOSED_CHANNEL_EXCEPTION);
-        }
-    }
-
-    /**
-     * Connect to the remote peer
-     */
-    protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
-        if (localAddress != null) {
-            fd().bind(localAddress);
-        }
-
-        boolean success = false;
-        try {
-            boolean connected = fd().connect(remoteAddress);
-            if (!connected) {
-                setFlag(Native.EPOLLOUT);
-            }
-            success = true;
-            return connected;
-        } finally {
-            if (!success) {
-                doClose();
-            }
         }
     }
 
@@ -816,148 +738,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             pipeline.fireExceptionCaught(cause);
             if (close || cause instanceof IOException) {
                 shutdownInput(false);
-            }
-        }
-
-        @Override
-        public void connect(
-                final SocketAddress remoteAddress, final SocketAddress localAddress, final ChannelPromise promise) {
-            if (!promise.setUncancellable() || !ensureOpen(promise)) {
-                return;
-            }
-
-            try {
-                if (connectPromise != null) {
-                    throw new ConnectionPendingException();
-                }
-
-                boolean wasActive = isActive();
-                if (doConnect(remoteAddress, localAddress)) {
-                    fulfillConnectPromise(promise, wasActive);
-                } else {
-                    connectPromise = promise;
-                    requestedRemoteAddress = remoteAddress;
-
-                    // Schedule connect timeout.
-                    int connectTimeoutMillis = config().getConnectTimeoutMillis();
-                    if (connectTimeoutMillis > 0) {
-                        connectTimeoutFuture = eventLoop().schedule(new Runnable() {
-                            @Override
-                            public void run() {
-                                ChannelPromise connectPromise = AbstractEpollStreamChannel.this.connectPromise;
-                                ConnectTimeoutException cause =
-                                        new ConnectTimeoutException("connection timed out: " + remoteAddress);
-                                if (connectPromise != null && connectPromise.tryFailure(cause)) {
-                                    close(voidPromise());
-                                }
-                            }
-                        }, connectTimeoutMillis, TimeUnit.MILLISECONDS);
-                    }
-
-                    promise.addListener(new ChannelFutureListener() {
-                        @Override
-                        public void operationComplete(ChannelFuture future) throws Exception {
-                            if (future.isCancelled()) {
-                                if (connectTimeoutFuture != null) {
-                                    connectTimeoutFuture.cancel(false);
-                                }
-                                connectPromise = null;
-                                close(voidPromise());
-                            }
-                        }
-                    });
-                }
-            } catch (Throwable t) {
-                closeIfClosed();
-                promise.tryFailure(annotateConnectException(t, remoteAddress));
-            }
-        }
-
-        private void fulfillConnectPromise(ChannelPromise promise, boolean wasActive) {
-            if (promise == null) {
-                // Closed via cancellation and the promise has been notified already.
-                return;
-            }
-            active = true;
-
-            // Get the state as trySuccess() may trigger an ChannelFutureListener that will close the Channel.
-            // We still need to ensure we call fireChannelActive() in this case.
-            boolean active = isActive();
-
-            // trySuccess() will return false if a user cancelled the connection attempt.
-            boolean promiseSet = promise.trySuccess();
-
-            // Regardless if the connection attempt was cancelled, channelActive() event should be triggered,
-            // because what happened is what happened.
-            if (!wasActive && active) {
-                pipeline().fireChannelActive();
-            }
-
-            // If a user cancelled the connection attempt, close the channel, which is followed by channelInactive().
-            if (!promiseSet) {
-                close(voidPromise());
-            }
-        }
-
-        private void fulfillConnectPromise(ChannelPromise promise, Throwable cause) {
-            if (promise == null) {
-                // Closed via cancellation and the promise has been notified already.
-                return;
-            }
-
-            // Use tryFailure() instead of setFailure() to avoid the race against cancel().
-            promise.tryFailure(cause);
-            closeIfClosed();
-        }
-
-        private void finishConnect() {
-            // Note this method is invoked by the event loop only if the connection attempt was
-            // neither cancelled nor timed out.
-
-            assert eventLoop().inEventLoop();
-
-            boolean connectStillInProgress = false;
-            try {
-                boolean wasActive = isActive();
-                if (!doFinishConnect()) {
-                    connectStillInProgress = true;
-                    return;
-                }
-                fulfillConnectPromise(connectPromise, wasActive);
-            } catch (Throwable t) {
-                fulfillConnectPromise(connectPromise, annotateConnectException(t, requestedRemoteAddress));
-            } finally {
-                if (!connectStillInProgress) {
-                    // Check for null as the connectTimeoutFuture is only created if a connectTimeoutMillis > 0 is used
-                    // See https://github.com/netty/netty/issues/1770
-                    if (connectTimeoutFuture != null) {
-                        connectTimeoutFuture.cancel(false);
-                    }
-                    connectPromise = null;
-                }
-            }
-        }
-
-        @Override
-        void epollOutReady() {
-            if (connectPromise != null) {
-                // pending connect which is now complete so handle it.
-                finishConnect();
-            } else {
-                super.epollOutReady();
-            }
-        }
-
-        /**
-         * Finish the connect
-         */
-        boolean doFinishConnect() throws Exception {
-            if (fd().finishConnect()) {
-                clearFlag(Native.EPOLLOUT);
-                return true;
-            } else {
-                setFlag(Native.EPOLLOUT);
-                return false;
             }
         }
 
@@ -1010,6 +790,10 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                         byteBuf.release();
                         byteBuf = null;
                         close = allocHandle.lastBytesRead() < 0;
+                        if (close) {
+                            // There is nothing left to read as we received an EOF.
+                            readPending = false;
+                        }
                         break;
                     }
                     allocHandle.incMessagesRead(1);
@@ -1085,7 +869,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             int splicedIn = 0;
             for (;;) {
                 // Splicing until there is nothing left to splice.
-                int localSplicedIn = Native.splice(fd().intValue(), -1, pipeOut.intValue(), -1, length);
+                int localSplicedIn = Native.splice(socket.intValue(), -1, pipeOut.intValue(), -1, length);
                 if (localSplicedIn == 0) {
                     break;
                 }
@@ -1185,7 +969,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         public boolean spliceOut() throws Exception {
             assert ch.eventLoop().inEventLoop();
             try {
-                int splicedOut = Native.splice(ch.pipeIn.intValue(), -1, ch.fd().intValue(), -1, len);
+                int splicedOut = Native.splice(ch.pipeIn.intValue(), -1, ch.socket.intValue(), -1, len);
                 len -= splicedOut;
                 if (len == 0) {
                     if (autoRead) {
@@ -1257,55 +1041,14 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
     }
 
-    private final class SocketWritableByteChannel implements WritableByteChannel {
-
-        @Override
-        public int write(ByteBuffer src) throws IOException {
-            final int written;
-            int position = src.position();
-            int limit = src.limit();
-            if (src.isDirect()) {
-                written = fd().write(src, position, src.limit());
-            } else {
-                final int readableBytes = limit - position;
-                ByteBuf buffer = null;
-                try {
-                    if (readableBytes == 0) {
-                        buffer = Unpooled.EMPTY_BUFFER;
-                    } else {
-                        final ByteBufAllocator alloc = alloc();
-                        if (alloc.isDirectBufferPooled()) {
-                            buffer = alloc.directBuffer(readableBytes);
-                        } else {
-                            buffer = ByteBufUtil.threadLocalDirectBuffer();
-                            if (buffer == null) {
-                                buffer = Unpooled.directBuffer(readableBytes);
-                            }
-                        }
-                    }
-                    buffer.writeBytes(src.duplicate());
-                    ByteBuffer nioBuffer = buffer.internalNioBuffer(buffer.readerIndex(), readableBytes);
-                    written = fd().write(nioBuffer, nioBuffer.position(), nioBuffer.limit());
-                } finally {
-                    if (buffer != null) {
-                        buffer.release();
-                    }
-                }
-            }
-            if (written > 0) {
-                src.position(position + written);
-            }
-            return written;
+    private final class EpollSocketWritableByteChannel extends SocketWritableByteChannel {
+        EpollSocketWritableByteChannel() {
+            super(socket);
         }
 
         @Override
-        public boolean isOpen() {
-            return fd().isOpen();
-        }
-
-        @Override
-        public void close() throws IOException {
-            fd().close();
+        protected ByteBufAllocator alloc() {
+            return AbstractEpollStreamChannel.this.alloc();
         }
     }
 }

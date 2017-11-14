@@ -36,6 +36,7 @@ import io.netty.channel.local.LocalServerChannel;
 import io.netty.handler.codec.http2.Http2TestUtil.FrameCountDown;
 import io.netty.handler.codec.http2.Http2TestUtil.Http2Runnable;
 import io.netty.util.AsciiString;
+import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.concurrent.Future;
 import org.junit.After;
 import org.junit.Before;
@@ -48,28 +49,35 @@ import org.mockito.stubbing.Answer;
 import java.io.ByteArrayOutputStream;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.netty.handler.codec.http2.Http2CodecUtil.CONNECTION_STREAM_ID;
+import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_PRIORITY_WEIGHT;
 import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
 import static io.netty.handler.codec.http2.Http2TestUtil.randomString;
 import static io.netty.handler.codec.http2.Http2TestUtil.runInChannel;
 import static io.netty.util.CharsetUtil.UTF_8;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.hamcrest.CoreMatchers.instanceOf;
+import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyLong;
 import static org.mockito.Mockito.anyShort;
-import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -111,28 +119,28 @@ public class Http2ConnectionRoundtripTest {
     @After
     public void teardown() throws Exception {
         if (clientChannel != null) {
-            clientChannel.close().sync();
+            clientChannel.close().syncUninterruptibly();
             clientChannel = null;
         }
         if (serverChannel != null) {
-            serverChannel.close().sync();
+            serverChannel.close().syncUninterruptibly();
             serverChannel = null;
         }
         final Channel serverConnectedChannel = this.serverConnectedChannel;
         if (serverConnectedChannel != null) {
-            serverConnectedChannel.close().sync();
+            serverConnectedChannel.close().syncUninterruptibly();
             this.serverConnectedChannel = null;
         }
-        Future<?> serverGroup = sb.config().group().shutdownGracefully(0, 0, MILLISECONDS);
-        Future<?> serverChildGroup = sb.config().childGroup().shutdownGracefully(0, 0, MILLISECONDS);
-        Future<?> clientGroup = cb.config().group().shutdownGracefully(0, 0, MILLISECONDS);
-        serverGroup.sync();
-        serverChildGroup.sync();
-        clientGroup.sync();
+        Future<?> serverGroup = sb.config().group().shutdownGracefully(0, 5, SECONDS);
+        Future<?> serverChildGroup = sb.config().childGroup().shutdownGracefully(0, 5, SECONDS);
+        Future<?> clientGroup = cb.config().group().shutdownGracefully(0, 5, SECONDS);
+        serverGroup.syncUninterruptibly();
+        serverChildGroup.syncUninterruptibly();
+        clientGroup.syncUninterruptibly();
     }
 
     @Test
-    public void inflightFrameAfterStreamResetShouldNotMakeConnectionUnsuable() throws Exception {
+    public void inflightFrameAfterStreamResetShouldNotMakeConnectionUnusable() throws Exception {
         bootstrapEnv(1, 1, 2, 1);
         final CountDownLatch latch = new CountDownLatch(1);
         doAnswer(new Answer<Void>() {
@@ -503,6 +511,71 @@ public class Http2ConnectionRoundtripTest {
     }
 
     @Test
+    public void headersWriteForPeerStreamWhichWasResetShouldNotGoAway() throws Exception {
+        bootstrapEnv(1, 1, 1, 0);
+
+        final CountDownLatch serverGotRstLatch = new CountDownLatch(1);
+        final CountDownLatch serverWriteHeadersLatch = new CountDownLatch(1);
+        final AtomicReference<Throwable> serverWriteHeadersCauseRef = new AtomicReference<Throwable>();
+
+        final Http2Headers headers = dummyHeaders();
+        final int streamId = 3;
+        runInChannel(clientChannel, new Http2Runnable() {
+            @Override
+            public void run() throws Http2Exception {
+                http2Client.encoder().writeHeaders(ctx(), streamId, headers, CONNECTION_STREAM_ID,
+                        DEFAULT_PRIORITY_WEIGHT, false, 0, false, newPromise());
+                http2Client.encoder().writeRstStream(ctx(), streamId, Http2Error.CANCEL.code(), newPromise());
+                http2Client.flush(ctx());
+            }
+        });
+
+        doAnswer(new Answer<Void>() {
+            @Override
+            public Void answer(InvocationOnMock invocationOnMock) throws Throwable {
+                if (streamId == (Integer) invocationOnMock.getArgument(1)) {
+                    serverGotRstLatch.countDown();
+                }
+                return null;
+            }
+        }).when(serverListener).onRstStreamRead(any(ChannelHandlerContext.class), eq(streamId), anyLong());
+
+        assertTrue(serverSettingsAckLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS, SECONDS));
+        assertTrue(serverGotRstLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS, SECONDS));
+
+        verify(serverListener).onHeadersRead(any(ChannelHandlerContext.class), eq(streamId), eq(headers), anyInt(),
+                anyShort(), anyBoolean(), anyInt(), eq(false));
+
+        // Now have the server attempt to send a headers frame simulating some asynchronous work.
+        runInChannel(serverConnectedChannel, new Http2Runnable() {
+            @Override
+            public void run() throws Http2Exception {
+                http2Server.encoder().writeHeaders(serverCtx(), streamId, headers, 0, true, serverNewPromise())
+                        .addListener(new ChannelFutureListener() {
+                            @Override
+                            public void operationComplete(ChannelFuture future) throws Exception {
+                                serverWriteHeadersCauseRef.set(future.cause());
+                                serverWriteHeadersLatch.countDown();
+                            }
+                        });
+                http2Server.flush(serverCtx());
+            }
+        });
+
+        assertTrue(serverWriteHeadersLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS, SECONDS));
+        Throwable serverWriteHeadersCause = serverWriteHeadersCauseRef.get();
+        assertNotNull(serverWriteHeadersCause);
+        assertThat(serverWriteHeadersCauseRef.get(), not(instanceOf(Http2Exception.class)));
+
+        // Server should receive a RST_STREAM for stream 3.
+        verify(serverListener, never()).onGoAwayRead(any(ChannelHandlerContext.class), anyInt(), anyLong(),
+                any(ByteBuf.class));
+        verify(clientListener, never()).onGoAwayRead(any(ChannelHandlerContext.class), anyInt(), anyLong(),
+                any(ByteBuf.class));
+        verify(clientListener, never()).onRstStreamRead(any(ChannelHandlerContext.class), anyInt(), anyLong());
+    }
+
+    @Test
     public void http2ExceptionInPipelineShouldCloseConnection() throws Exception {
         bootstrapEnv(1, 1, 2, 1);
 
@@ -578,6 +651,79 @@ public class Http2ConnectionRoundtripTest {
         // Wait for the close to occur.
         assertTrue(closeLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS, SECONDS));
         assertFalse(clientChannel.isOpen());
+    }
+
+    private enum WriteEmptyBufferMode {
+        SINGLE_END_OF_STREAM,
+        SECOND_END_OF_STREAM,
+        SINGLE_WITH_TRAILERS,
+        SECOND_WITH_TRAILERS
+    }
+
+    @Test
+    public void writeOfEmptyReleasedBufferSingleBufferQueuedInFlowControllerShouldFail() throws Exception {
+        writeOfEmptyReleasedBufferQueuedInFlowControllerShouldFail(WriteEmptyBufferMode.SINGLE_END_OF_STREAM);
+    }
+
+    @Test
+    public void writeOfEmptyReleasedBufferSingleBufferTrailersQueuedInFlowControllerShouldFail() throws Exception {
+        writeOfEmptyReleasedBufferQueuedInFlowControllerShouldFail(WriteEmptyBufferMode.SINGLE_WITH_TRAILERS);
+    }
+
+    @Test
+    public void writeOfEmptyReleasedBufferMultipleBuffersQueuedInFlowControllerShouldFail() throws Exception {
+        writeOfEmptyReleasedBufferQueuedInFlowControllerShouldFail(WriteEmptyBufferMode.SECOND_END_OF_STREAM);
+    }
+
+    @Test
+    public void writeOfEmptyReleasedBufferMultipleBuffersTrailersQueuedInFlowControllerShouldFail() throws Exception {
+        writeOfEmptyReleasedBufferQueuedInFlowControllerShouldFail(WriteEmptyBufferMode.SECOND_WITH_TRAILERS);
+    }
+
+    public void writeOfEmptyReleasedBufferQueuedInFlowControllerShouldFail(final WriteEmptyBufferMode mode)
+            throws Exception {
+        bootstrapEnv(1, 1, 2, 1);
+
+        final ChannelPromise emptyDataPromise = newPromise();
+        runInChannel(clientChannel, new Http2Runnable() {
+            @Override
+            public void run() throws Http2Exception {
+                http2Client.encoder().writeHeaders(ctx(), 3, EmptyHttp2Headers.INSTANCE, 0, (short) 16, false, 0, false,
+                        newPromise());
+                ByteBuf emptyBuf = Unpooled.buffer();
+                emptyBuf.release();
+                switch (mode) {
+                    case SINGLE_END_OF_STREAM:
+                        http2Client.encoder().writeData(ctx(), 3, emptyBuf, 0, true, emptyDataPromise);
+                        break;
+                    case SECOND_END_OF_STREAM:
+                        http2Client.encoder().writeData(ctx(), 3, emptyBuf, 0, false, emptyDataPromise);
+                        http2Client.encoder().writeData(ctx(), 3, randomBytes(8), 0, true, newPromise());
+                        break;
+                    case SINGLE_WITH_TRAILERS:
+                        http2Client.encoder().writeData(ctx(), 3, emptyBuf, 0, false, emptyDataPromise);
+                        http2Client.encoder().writeHeaders(ctx(), 3, EmptyHttp2Headers.INSTANCE, 0,
+                                (short) 16, false, 0, true, newPromise());
+                        break;
+                    case SECOND_WITH_TRAILERS:
+                        http2Client.encoder().writeData(ctx(), 3, emptyBuf, 0, false, emptyDataPromise);
+                        http2Client.encoder().writeData(ctx(), 3, randomBytes(8), 0, false, newPromise());
+                        http2Client.encoder().writeHeaders(ctx(), 3, EmptyHttp2Headers.INSTANCE, 0,
+                                (short) 16, false, 0, true, newPromise());
+                        break;
+                    default:
+                        throw new Error();
+                }
+                http2Client.flush(ctx());
+            }
+        });
+
+        try {
+            emptyDataPromise.get();
+            fail();
+        } catch (ExecutionException e) {
+            assertThat(e.getCause(), is(instanceOf(IllegalReferenceCountException.class)));
+        }
     }
 
     @Test
@@ -864,7 +1010,7 @@ public class Http2ConnectionRoundtripTest {
                 p.addLast(new ChannelInboundHandlerAdapter() {
                     @Override
                     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
-                        if (evt instanceof Http2ConnectionPrefaceWrittenEvent) {
+                        if (evt == Http2ConnectionPrefaceAndSettingsFrameWrittenEvent.INSTANCE) {
                             prefaceWrittenLatch.countDown();
                             ctx.pipeline().remove(this);
                         }

@@ -241,7 +241,7 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
 
             if (m instanceof DecoderResultProvider && !((DecoderResultProvider) m).decoderResult().isSuccess()) {
                 O aggregated;
-                if (m instanceof ByteBufHolder && ((ByteBufHolder) m).content().isReadable()) {
+                if (m instanceof ByteBufHolder) {
                     aggregated = beginAggregation(m, ((ByteBufHolder) m).content().retain());
                 } else {
                     aggregated = beginAggregation(m, EMPTY_BUFFER);
@@ -397,6 +397,17 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
     protected void handleOversizedMessage(ChannelHandlerContext ctx, S oversized) throws Exception {
         ctx.fireExceptionCaught(
                 new TooLongFrameException("content length exceeded " + maxContentLength() + " bytes."));
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // We might need keep reading the channel until the full message is aggregated.
+        //
+        // See https://github.com/netty/netty/issues/6583
+        if (currentMessage != null && !ctx.channel().config().isAutoRead()) {
+            ctx.read();
+        }
+        ctx.fireChannelReadComplete();
     }
 
     @Override

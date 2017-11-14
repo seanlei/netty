@@ -364,7 +364,7 @@ public abstract class ReplayingDecoder<S> extends ByteToMessageDecoder {
                 S oldState = state;
                 int oldInputLength = in.readableBytes();
                 try {
-                    decode(ctx, replayable, out);
+                    decodeRemovalReentryProtection(ctx, replayable, out);
 
                     // Check if this handler was removed before continuing the loop.
                     // If it was removed, it is not safe to continue to operate on the buffer.
@@ -418,7 +418,7 @@ public abstract class ReplayingDecoder<S> extends ByteToMessageDecoder {
             }
         } catch (DecoderException e) {
             throw e;
-        } catch (Throwable cause) {
+        } catch (Exception cause) {
             throw new DecoderException(cause);
         }
     }
